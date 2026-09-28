@@ -40,6 +40,48 @@ fun IconPlay(color: Color, size: Dp = 22.dp) {
     }
 }
 
+/**
+ * Морфинг-иконка: progress = 0 → play-треугольник, progress = 1 → stop-квадрат.
+ * Промежуточные значения — плавная трансформация фигуры.
+ */
+@Composable
+fun IconPlayStop(progress: Float, color: Color, size: Dp = 22.dp) {
+    Canvas(Modifier.size(size)) {
+        val w = this.size.width
+        val h = this.size.height
+        val t = progress.coerceIn(0f, 1f)
+
+        val tlX = w * 0.30f
+        val tlY = h * (0.18f + (0.30f - 0.18f) * t)
+        val trX = w * (0.82f + (0.70f - 0.82f) * t)
+        val trY = h * (0.50f + (0.30f - 0.50f) * t)
+        val brX = w * (0.82f + (0.70f - 0.82f) * t)
+        val brY = h * (0.50f + (0.70f - 0.50f) * t)
+        val blX = w * 0.30f
+        val blY = h * (0.82f + (0.70f - 0.82f) * t)
+
+        val path = Path().apply {
+            moveTo(tlX, tlY)
+            lineTo(trX, trY)
+            lineTo(brX, brY)
+            lineTo(blX, blY)
+            close()
+        }
+        drawPath(
+            path = path,
+            color = color,
+            style = Stroke(
+                width = 2.dp.toPx(),
+                cap = StrokeCap.Round,
+                join = StrokeJoin.Round,
+                pathEffect = PathEffect.cornerPathEffect(
+                    (3.dp.toPx() * (1f - t) + 2.dp.toPx() * t),
+                ),
+            ),
+        )
+    }
+}
+
 @Composable
 fun IconPause(color: Color, size: Dp = 22.dp) {
     Canvas(Modifier.size(size)) {
@@ -75,8 +117,8 @@ fun IconStop(color: Color, size: Dp = 22.dp) {
         val stroke = 2.dp.toPx()
         drawRoundRect(
             color = color,
-            topLeft = Offset(w * 0.28f, h * 0.28f),
-            size = Size(w * 0.44f, h * 0.44f),
+            topLeft = Offset(w * 0.30f, h * 0.30f),
+            size = Size(w * 0.40f, h * 0.40f),
             cornerRadius = CornerRadius(w * 0.06f, w * 0.06f),
             style = Stroke(width = stroke),
         )
@@ -210,7 +252,6 @@ fun IconLoop(color: Color, size: Dp = 22.dp) {
             size = Size(r * 2, r * 2),
             style = Stroke(width = stroke, cap = StrokeCap.Round),
         )
-
         drawArc(
             color = color,
             startAngle = 20f,
@@ -271,5 +312,52 @@ fun IconSend(color: Color, size: Dp = 22.dp) {
         drawLine(color, Offset(w * 0.20f, h * 0.50f), Offset(w * 0.80f, h * 0.50f), stroke, cap)
         drawLine(color, Offset(w * 0.60f, h * 0.30f), Offset(w * 0.80f, h * 0.50f), stroke, cap)
         drawLine(color, Offset(w * 0.60f, h * 0.70f), Offset(w * 0.80f, h * 0.50f), stroke, cap)
+    }
+}
+
+/** Арфа — символ Aria. Цвет берётся из темы, поэтому меняется при смене. */
+@Composable
+fun IconHarp(color: Color, size: Dp = 22.dp) {
+    Canvas(Modifier.size(size)) {
+        val w = this.size.width
+        val h = this.size.height
+
+        // Колонна — вертикаль слева
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(w * 0.18f, h * 0.25f),
+            size = Size(w * 0.08f, h * 0.65f),
+            cornerRadius = CornerRadius(w * 0.03f, w * 0.03f),
+        )
+
+        // Шея — наклонная линия сверху
+        drawLine(
+            color = color,
+            start = Offset(w * 0.22f, h * 0.22f),
+            end = Offset(w * 0.78f, h * 0.42f),
+            strokeWidth = w * 0.06f,
+            cap = StrokeCap.Round,
+        )
+
+        // Резонатор — горизонталь снизу
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(w * 0.18f, h * 0.82f),
+            size = Size(w * 0.70f, h * 0.08f),
+            cornerRadius = CornerRadius(w * 0.04f, w * 0.04f),
+        )
+
+        // Струны — 4 вертикали с разным верхом
+        for (i in 0 until 4) {
+            val x = w * (0.32f + i * 0.14f)
+            val topY = h * (0.28f + i * 0.045f)
+            drawLine(
+                color = color,
+                start = Offset(x, topY),
+                end = Offset(x, h * 0.82f),
+                strokeWidth = w * 0.025f,
+                cap = StrokeCap.Round,
+            )
+        }
     }
 }

@@ -12,6 +12,8 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -22,12 +24,16 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.aria.midi.AudioExporter
 import com.aria.midi.MidiPlayer
+import com.aria.midi.TimedNote
 import com.aria.stats.StatsCollector
+import com.aria.train.ModelSummary
 import com.aria.train.TrainState
 import com.aria.train.TrainerService
 import kotlinx.coroutines.CoroutineScope
@@ -35,9 +41,19 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.LocalTime
 import java.util.Locale
+
+/** Единый запрос на воспроизведение для сгенерированных мелодий. */
+data class PlaybackRequest(
+    val notes: List<Int>,
+    val noteMs: Int,
+    val source: String,
+    val tempoBpm: Int,
+)
 
 class MainActivity : ComponentActivity() {
 
@@ -103,29 +119,67 @@ class MainActivity : ComponentActivity() {
             var showFaq by remember { mutableStateOf(false) }
             var showLibrary by remember { mutableStateOf(false) }
             var showPrompt by remember { mutableStateOf(false) }
-            var lastNotes by remember { mutableStateOf<List<Int>>(emptyList()) }
+            var lastPlayback by remember { mutableStateOf<PlaybackRequest?>(null) }
+            var lastTimedNotes by remember { mutableStateOf<List<TimedNote>>(emptyList()) }
 
             var importedFiles by remember { mutableStateOf<List<File>>(emptyList()) }
             var createdFiles by remember { mutableStateOf<List<File>>(emptyList()) }
 
+            var modelSummary by remember { mutableStateOf(trainer.summary()) }
+
+            // Тикаем 1 раз в секунду, чтобы таймер обучения в UI обновлялся
+            var elapsedTick by remember { mutableStateOf(0L) }
+            LaunchedEffect(Unit) {
+                while (true) {
+                    delay(1000)
+                    elapsedTick = System.currentTimeMillis()
+                }
+            }
+
             fun refreshLibrary() {
                 importedFiles = trainer.listImportedMidi()
                 createdFiles = trainer.listCreatedMidi()
+                modelSummary = trainer.summary()
+            }
+
+            fun playFrom(req: PlaybackRequest) {
+                lastPlayback = req
+                lastTimedNotes = req.notes.mapIndexed { i, n ->
+                    TimedNote(
+                        note = n,
+                        startMs = i.toLong() * req.noteMs,
+                        durationMs = req.noteMs,
+                        velocity = 80,
+                        channel = 0,
+                    )
+                }
+                midiPlayer.play(
+                    notes = req.notes,
+                    noteMs = req.noteMs,
+                    volume = 0.35f,
+                    source = req.source,
+                    tempoBpm = req.tempoBpm,
+                )
             }
 
             val stats by statsCollector.stats.collectAsStateWithLifecycle()
             val trainState by trainer.state.collectAsStateWithLifecycle()
+            val lossHistory by trainer.lossHistory.collectAsStateWithLifecycle()
             val playerState by midiPlayer.state.collectAsStateWithLifecycle()
             val logLines = remember { mutableStateListOf<String>() }
 
-            SideEffect {
-                currentTrainState = trainState
-            }
+            SideEffect { currentTrainState = trainState }
 
             LaunchedEffect(Unit) {
                 trainer.log.collect { line ->
                     logLines.add(line)
                     if (logLines.size > 200) logLines.removeAt(0)
+                    if (line.contains("imported ") ||
+                        line.contains("mask updated") ||
+                        line.contains("restored")
+                    ) {
+                        modelSummary = trainer.summary()
+                    }
                 }
             }
 
@@ -152,16 +206,17 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            LaunchedEffect(showLibrary) {
-                if (showLibrary) refreshLibrary()
-            }
+            LaunchedEffect(showLibrary) { if (showLibrary) refreshLibrary() }
 
             CompositionLocalProvider(LocalAriaColors provides theme) {
                 AriaScreen(
                     stats = stats,
                     trainState = trainState,
+                    lossHistory = lossHistory,
+                    elapsedMs = trainer.trainingElapsedMs(),
+                    elapsedTick = elapsedTick,
                     playerState = playerState,
-                    modelLabel = trainer.modelInfo.label(),
+                    summary = modelSummary,
                     logLines = logLines,
                     showLibrary = showLibrary,
                     importedFiles = importedFiles,
@@ -171,16 +226,23 @@ class MainActivity : ComponentActivity() {
                     onOpenFaq = { showFaq = true },
                     onOpenPrompt = { showPrompt = true },
 
-                    onTrain = { trainer.start(activityScope) },
+                    onToggleTrain = {
+                        if (trainState.running) trainer.stopTraining()
+                        else trainer.start(activityScope)
+                    },
                     onImportMidi = { importMidi.launch(arrayOf("*/*")) },
-                    onPause = { trainer.stopTraining() },
+
                     onSave = {
                         if (!hasStoragePermission()) {
                             logLines.add("[${now()}] storage permission required — opening settings")
                             if (logLines.size > 200) logLines.removeAt(0)
                             requestStoragePermission()
                         } else {
-                            trainer.saveNow()
+                            val saved = trainer.saveNow()
+                            if (!saved) {
+                                logLines.add("[${now()}] save: no changes since last checkpoint")
+                                if (logLines.size > 200) logLines.removeAt(0)
+                            }
                         }
                     },
 
@@ -188,12 +250,63 @@ class MainActivity : ComponentActivity() {
                     onLibraryDismiss = { showLibrary = false },
                     onLibraryRefresh = { refreshLibrary() },
 
+                    onExport = {
+                        val notes = lastTimedNotes
+                        if (notes.isEmpty()) {
+                            logLines.add("[${now()}] export: nothing to export")
+                            if (logLines.size > 200) logLines.removeAt(0)
+                        } else {
+                            activityScope.launch(Dispatchers.IO) {
+                                try {
+                                    val outDir = File(trainer.outputsDir(), "audio")
+                                        .apply { mkdirs() }
+                                    val result = AudioExporter.export(
+                                        notes = notes,
+                                        outputDir = outDir,
+                                        baseName = "aria_export",
+                                        withReverb = true,
+                                    )
+                                    withContext(Dispatchers.Main) {
+                                        logLines.add(
+                                            "[${now()}] exported ${result.durationMs / 1000}s  " +
+                                                    "wav=${result.wav?.name ?: "—"}  " +
+                                                    "m4a=${result.m4a?.name ?: "—"}"
+                                        )
+                                        if (logLines.size > 200) logLines.removeAt(0)
+                                    }
+                                    refreshLibrary()
+                                } catch (e: Exception) {
+                                    withContext(Dispatchers.Main) {
+                                        logLines.add("[${now()}] export failed: ${e.message}")
+                                        if (logLines.size > 200) logLines.removeAt(0)
+                                    }
+                                }
+                            }
+                        }
+                    },
+
                     onLibrarySelectFile = { file ->
-                        val notes = trainer.parseMidiFile(file)
-                        if (notes != null) {
-                            lastNotes = notes
-                            midiPlayer.play(notes, noteMs = gen.noteMs, volume = 0.35f)
-                            logLines.add("[${now()}] ▶ playing ${file.name}  (${notes.size} notes)")
+                        val parsed = trainer.parseMidiFile(file)
+                        if (parsed != null && parsed.timedNotes.isNotEmpty()) {
+                            lastTimedNotes = parsed.timedNotes
+                            lastPlayback = null
+                            midiPlayer.playTimed(
+                                notes = parsed.timedNotes,
+                                volume = 0.35f,
+                                source = file.name,
+                                tempoBpm = parsed.tempoBpm,
+                                singleNoteMs = 0,
+                                hasDrums = parsed.drumCount > 0,
+                                drumCount = parsed.drumCount,
+                                tempoChanges = parsed.tempoChanges,
+                            )
+                            logLines.add(
+                                "[${now()}] ▶ ${file.name}  ${parsed.timedNotes.size}n  " +
+                                        "${parsed.tempoBpm}BPM  " +
+                                        "len=${parsed.totalMs / 1000}s  " +
+                                        "tempo×${parsed.tempoChanges}  " +
+                                        "drums=${parsed.drumCount}"
+                            )
                             if (logLines.size > 200) logLines.removeAt(0)
                         } else {
                             logLines.add("[${now()}] cannot play ${file.name}")
@@ -212,16 +325,19 @@ class MainActivity : ComponentActivity() {
                             length = gen.length,
                             temperature = gen.temperature,
                         )
-                        lastNotes = notes
-                        midiPlayer.play(notes, noteMs = gen.noteMs, volume = 0.35f)
-                        trainer.saveMelodyAsMidi(
+                        val req = PlaybackRequest(
                             notes = notes,
-                            tempoBpm = 120,
                             noteMs = gen.noteMs,
+                            source = "aria · generated",
+                            tempoBpm = 120,
+                        )
+                        playFrom(req)
+                        trainer.saveMelodyAsMidi(
+                            notes = notes, tempoBpm = 120, noteMs = gen.noteMs,
                         )
                         logLines.add(
-                            "[${now()}] ▶ generated ${notes.size} notes " +
-                                    "(T=${fmt2(gen.temperature)})"
+                            "[${now()}] ▶ generated ${notes.size}n  " +
+                                    "(T=${fmt2(gen.temperature)}, ${gen.noteMs}ms)"
                         )
                         if (logLines.size > 200) logLines.removeAt(0)
                         refreshLibrary()
@@ -230,15 +346,14 @@ class MainActivity : ComponentActivity() {
                     onPlayerPlayPause = {
                         if (playerState.playing) {
                             midiPlayer.togglePause()
-                        } else if (lastNotes.isNotEmpty()) {
-                            midiPlayer.play(lastNotes, noteMs = gen.noteMs, volume = 0.35f)
-                        }
+                        } else if (playerState.totalMs > 0) {
+                            midiPlayer.resume()
+                        } else lastPlayback?.let { playFrom(it) }
                     },
                     onPlayerStop = { midiPlayer.stop() },
                     onPlayerToggleLoop = { midiPlayer.setLoop(!playerState.loop) },
                 )
 
-                // ---------- PROMPT → VARIATIONS ----------
                 if (showPrompt) {
                     PromptDialog(
                         onGenerate = { text ->
@@ -246,31 +361,30 @@ class MainActivity : ComponentActivity() {
                             val results = trainer.generateVariations(text, count = 3)
                             results.mapIndexed { i, r ->
                                 VariationItem(
-                                    index = i,
-                                    notes = r.notes,
+                                    index = i, notes = r.notes,
                                     temperature = r.params.temperature,
                                     noteMs = r.params.noteMs,
-                                    label = "v${i + 1}",
-                                    tag = tag,
+                                    label = "v${i + 1}", tag = tag,
                                 )
                             }
                         },
                         onPlay = { v ->
-                            lastNotes = v.notes
-                            midiPlayer.play(v.notes, noteMs = v.noteMs, volume = 0.35f)
+                            val req = PlaybackRequest(
+                                notes = v.notes, noteMs = v.noteMs,
+                                source = "aria · ${v.label}", tempoBpm = 120,
+                            )
+                            playFrom(req)
                             logLines.add(
                                 "[${now()}] ▶ ${v.label}  " +
-                                        "T=${fmt2(v.temperature)}  notes=${v.notes.size}  " +
-                                        "noteMs=${v.noteMs}"
+                                        "T=${fmt2(v.temperature)}  ${v.notes.size}n  " +
+                                        "${v.noteMs}ms"
                             )
                             if (logLines.size > 200) logLines.removeAt(0)
                         },
                         onSave = { v ->
                             trainer.saveMelodyAsMidi(
-                                notes = v.notes,
-                                tempoBpm = 120,
-                                noteMs = v.noteMs,
-                                tag = v.tag,
+                                notes = v.notes, tempoBpm = 120,
+                                noteMs = v.noteMs, tag = v.tag,
                             )
                             refreshLibrary()
                         },
@@ -298,10 +412,7 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                FaqOverlay(
-                    visible = showFaq,
-                    onDismiss = { showFaq = false },
-                )
+                FaqOverlay(visible = showFaq, onDismiss = { showFaq = false })
             }
         }
     }
@@ -325,8 +436,6 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    // ---------- Разрешения ----------
-
     private fun hasStoragePermission(): Boolean {
         val flagOK = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             Environment.isExternalStorageManager()
@@ -336,7 +445,6 @@ class MainActivity : ComponentActivity() {
             ) == PackageManager.PERMISSION_GRANTED
         }
         if (!flagOK) return false
-
         return try {
             val target = File(
                 Environment.getExternalStorageDirectory(),
@@ -344,8 +452,7 @@ class MainActivity : ComponentActivity() {
             )
             target.mkdirs()
             val probe = File(target, ".aria_probe")
-            probe.writeText("ok")
-            probe.delete()
+            probe.writeText("ok"); probe.delete()
             true
         } catch (_: Exception) { false }
     }
@@ -389,8 +496,7 @@ class MainActivity : ComponentActivity() {
         return try {
             if (!external.exists()) external.mkdirs()
             val probe = File(external, ".aria_write_test")
-            probe.writeText("ok")
-            probe.delete()
+            probe.writeText("ok"); probe.delete()
             external
         } catch (_: Exception) {
             File(filesDir, "Aria models external fallback").apply { mkdirs() }
@@ -405,8 +511,11 @@ class MainActivity : ComponentActivity() {
 fun AriaScreen(
     stats: com.aria.stats.AriaStats,
     trainState: TrainState,
+    lossHistory: List<Float>,
+    elapsedMs: Long,
+    elapsedTick: Long,
     playerState: com.aria.midi.PlayerState,
-    modelLabel: String,
+    summary: ModelSummary,
     logLines: List<String>,
     showLibrary: Boolean,
     importedFiles: List<File>,
@@ -416,10 +525,10 @@ fun AriaScreen(
     onOpenFaq: () -> Unit,
     onOpenPrompt: () -> Unit,
 
-    onTrain: () -> Unit,
+    onToggleTrain: () -> Unit,
     onImportMidi: () -> Unit,
-    onPause: () -> Unit,
     onSave: () -> Unit,
+    onExport: () -> Unit,
 
     onToggleLibrary: () -> Unit,
     onLibraryDismiss: () -> Unit,
@@ -434,57 +543,62 @@ fun AriaScreen(
 ) {
     val c = LocalAriaColors.current
 
+    val trainProgress by animateFloatAsState(
+        targetValue = if (trainState.running) 1f else 0f,
+        animationSpec = tween(durationMillis = 280),
+        label = "trainProgress",
+    )
+
     Box(Modifier.fillMaxSize()) {
-        Row(
-            Modifier
-                .fillMaxSize()
-                .background(c.bg)
-        ) {
+        Row(Modifier.fillMaxSize().background(c.bg)) {
             Column(
                 Modifier
                     .weight(1f)
                     .fillMaxHeight()
                     .padding(12.dp)
             ) {
+                // Шапка
                 Row(
                     Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
-                    Text(
-                        "ARIA  v0.7.0",
-                        color = c.accent,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 18.sp,
-                    )
+                    Row(
+                        Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        IconHarp(c.accent, size = 22.dp)
+                        Text(
+                            "ARIA  v0.9.0",
+                            color = c.accent,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 18.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         AriaIconButton(
                             onClick = onOpenFaq,
                             modifier = Modifier.size(40.dp),
-                        ) {
-                            IconFaq(c.accent, size = 20.dp)
-                        }
+                        ) { IconFaq(c.accent, size = 20.dp) }
                         AriaIconButton(
                             onClick = onOpenSettings,
                             modifier = Modifier.size(40.dp),
-                        ) {
-                            IconSliders(c.accent, size = 20.dp)
-                        }
+                        ) { IconSliders(c.accent, size = 20.dp) }
                     }
                 }
 
                 HorizontalDivider(color = c.line, modifier = Modifier.padding(vertical = 8.dp))
 
+                // Лог
                 val scrollState = rememberScrollState()
                 LaunchedEffect(logLines.size) {
                     scrollState.animateScrollTo(scrollState.maxValue)
                 }
 
-                Column(
-                    Modifier
-                        .weight(1f)
-                        .verticalScroll(scrollState)
-                ) {
+                Column(Modifier.weight(1f).verticalScroll(scrollState)) {
                     logLines.forEach {
                         Text(
                             it,
@@ -495,22 +609,31 @@ fun AriaScreen(
                     }
                 }
 
-                HorizontalDivider(color = c.line, modifier = Modifier.padding(vertical = 8.dp))
+                HorizontalDivider(color = c.line, modifier = Modifier.padding(vertical = 6.dp))
 
+                // График обучения
+                // (elapsedTick используется как ключ, чтобы перекомпоновка раз в секунду)
+                val liveElapsed = if (trainState.running) elapsedMs + 0L else elapsedMs
+                LossChart(
+                    history = lossHistory,
+                    elapsedMs = liveElapsed,
+                    bestLoss = trainState.bestLoss,
+                    running = trainState.running,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
+                HorizontalDivider(color = c.line, modifier = Modifier.padding(vertical = 6.dp))
+
+                // Кнопки
                 Row(
                     Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     AriaIconButton(
-                        onClick = onTrain,
+                        onClick = onToggleTrain,
                         onLongClick = onImportMidi,
                         modifier = Modifier.weight(1f).height(52.dp),
-                    ) { IconPlay(c.accent) }
-
-                    AriaIconButton(
-                        onClick = onPause,
-                        modifier = Modifier.weight(1f).height(52.dp),
-                    ) { IconStop(c.accent) }
+                    ) { IconPlayStop(progress = trainProgress, color = c.accent) }
 
                     AriaIconButton(
                         onClick = onSave,
@@ -525,19 +648,27 @@ fun AriaScreen(
                 }
             }
 
-            Column(
-                Modifier
-                    .width(150.dp)
-                    .fillMaxHeight()
-            ) {
+            Column(Modifier.width(150.dp).fillMaxHeight()) {
                 StatsPanel(
                     stats = stats,
                     trainState = trainState,
-                    modelLabel = modelLabel,
+                    summary = summary,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1.2f),
+                )
+
+                HorizontalDivider(color = c.line)
+
+                NoteListPanel(
+                    playerState = playerState,
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f),
                 )
+
+                HorizontalDivider(color = c.line)
+
                 MidiPlayerPanel(
                     state = playerState,
                     onPlayPause = onPlayerPlayPause,
@@ -555,6 +686,7 @@ fun AriaScreen(
             onSelectFile = onLibrarySelectFile,
             onDeleteFile = onLibraryDeleteFile,
             onGenerateNew = onLibraryGenerateNew,
+            onExport = onExport,
             onRefresh = onLibraryRefresh,
             onDismiss = onLibraryDismiss,
             modifier = Modifier

@@ -7,6 +7,7 @@ import com.aria.midi.MidiWriter
 import com.aria.nn.AriaNet
 import com.aria.nn.Checkpoint
 import com.aria.nn.ModelInfo
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -32,13 +33,27 @@ data class TrainState(
     val step: Long = 0,
 )
 
+data class ModelSummary(
+    val label: String,
+    val params: Long,
+    val vocab: Int,
+    val alive: Int,
+    val embDim: Int,
+    val hidden: Int,
+    val melodies: Int,
+    val tokenCount: Long,
+)
+
 class TrainerService(
     private val storageDir: File,
     private val internalRoot: File,
 ) {
 
     companion object {
-        const val MODEL_VERSION = 2   // новая архитектура: vocab=128 + маска
+        const val MODEL_VERSION = 2
+        const val EMB_DIM = 16
+        const val HIDDEN = 32
+        const val LOSS_HISTORY_SIZE = 200
     }
 
     // ---------- Папки ----------
@@ -49,15 +64,14 @@ class TrainerService(
     private val initialMidiLog: List<String> =
         Melodies.loadAllFromFolder(midiFolder, midiTracker)
 
-    // ---------- Сеть (всегда vocab=128) ----------
+    // ---------- Сеть ----------
     private val net = AriaNet(
         vocab = Melodies.VOCAB_SIZE,
-        embDim = 16,
-        hidden = 32,
+        embDim = EMB_DIM,
+        hidden = HIDDEN,
         lr = 0.001f,
     )
 
-    /** Маска «живых» нот — какие ноты встречаются в текущем датасете. */
     @Volatile
     private var mask: BooleanArray = Melodies.buildMask()
 
@@ -92,6 +106,10 @@ class TrainerService(
     private val _state = MutableStateFlow(TrainState())
     val state: StateFlow<TrainState> = _state.asStateFlow()
 
+    /** История loss для графика. Скользящее окно LOSS_HISTORY_SIZE точек. */
+    private val _lossHistory = MutableStateFlow<List<Float>>(emptyList())
+    val lossHistory: StateFlow<List<Float>> = _lossHistory.asStateFlow()
+
     private val _log = MutableSharedFlow<String>(extraBufferCapacity = 256)
     val log: SharedFlow<String> = _log.asSharedFlow()
 
@@ -104,6 +122,21 @@ class TrainerService(
     @Volatile
     private var stopRequested = false
 
+    private var runId: Long = 0L
+
+    @Volatile
+    private var trainingStartedAtMs: Long = 0L
+
+    /** Сколько миллисекунд идёт текущий прогон. 0 — если обучение не запускалось. */
+    fun trainingElapsedMs(): Long {
+        val start = trainingStartedAtMs
+        if (start <= 0L || !_state.value.running) {
+            // Если остановлено — держим значение, но не растёт
+            return if (start <= 0L) 0L else System.currentTimeMillis() - start
+        }
+        return System.currentTimeMillis() - start
+    }
+
     // ---------- INIT ----------
     init {
         writeFile("[${now()}] model:  ${modelInfo.label()}  (${modelInfo.params} params)")
@@ -115,20 +148,16 @@ class TrainerService(
         _log.tryEmit("[${now()}] ${modelInfo.label()}  (${modelInfo.params} params)")
         _log.tryEmit("[${now()}] midi folder: ${midiFolder.absolutePath}")
 
-        // Строки автоимпорта MIDI
         initialMidiLog.forEach { raw ->
             val line = "[${now()}] $raw"
-            writeFile(line)
-            _log.tryEmit(line)
+            writeFile(line); _log.tryEmit(line)
         }
 
-        // Маска по факту
         mask = Melodies.buildMask()
         val alive = mask.count { it }
         writeFile("[${now()}] mask: $alive notes alive out of ${mask.size}")
         _log.tryEmit("[${now()}] vocab=${mask.size}  alive=$alive  melodies=${Melodies.raw.size}")
 
-        // Проверка зеркала
         val mirrorOK = try {
             val probe = File(mirrorDir, ".aria_probe")
             probe.writeText("ok"); probe.delete(); true
@@ -139,7 +168,6 @@ class TrainerService(
             writeFile(m); _log.tryEmit(m)
         }
 
-        // Миграция чекпойнта из зеркала
         if (!ckptFile.exists() && mirrorFile.exists()) {
             try {
                 mirrorFile.copyTo(ckptFile, overwrite = true)
@@ -147,31 +175,21 @@ class TrainerService(
             } catch (_: Exception) {}
         }
 
-        // Загрузка чекпойнта
         if (ckptFile.exists()) {
             try {
                 val meta = Checkpoint.load(ckptFile, net)
                 val safeBest = if (meta.bestLoss.isNaN() ||
-                    meta.bestLoss.isInfinite() ||
-                    meta.bestLoss <= 0f
+                    meta.bestLoss.isInfinite() || meta.bestLoss <= 0f
                 ) Float.MAX_VALUE else meta.bestLoss
 
                 _state.value = TrainState(
-                    epoch = meta.epoch,
-                    loss = safeBest,
-                    bestLoss = safeBest,
-                    running = false,
-                    step = meta.step,
+                    epoch = meta.epoch, loss = safeBest, bestLoss = safeBest,
+                    running = false, step = meta.step,
                 )
                 lastCkptEpoch = meta.epoch
                 val line = "restored  epoch=${meta.epoch} best=${fmt4(safeBest)}"
                 writeFile("[${now()}] $line")
                 _log.tryEmit("[${now()}] $line")
-
-                if (safeBest == Float.MAX_VALUE) {
-                    val m = "[${now()}] warning: checkpoint had invalid bestLoss, reset"
-                    writeFile(m); _log.tryEmit(m)
-                }
             } catch (e: Exception) {
                 try {
                     val broken = File(
@@ -187,6 +205,23 @@ class TrainerService(
                 }
             }
         }
+    }
+
+    // ---------- SUMMARY ----------
+
+    fun summary(): ModelSummary {
+        var tokens = 0L
+        Melodies.raw.forEach { m -> tokens += m.size }
+        return ModelSummary(
+            label = modelInfo.label(),
+            params = modelInfo.params,
+            vocab = Melodies.VOCAB_SIZE,
+            alive = mask.count { it },
+            embDim = EMB_DIM,
+            hidden = HIDDEN,
+            melodies = Melodies.raw.size,
+            tokenCount = tokens,
+        )
     }
 
     // ---------- RESCAN MIDI ----------
@@ -217,6 +252,8 @@ class TrainerService(
     fun start(scope: CoroutineScope, epochsPerTick: Int = 4, tickDelayMs: Long = 16L) {
         if (job?.isActive == true) return
         stopRequested = false
+        val myId = ++runId
+        trainingStartedAtMs = System.currentTimeMillis()
 
         job = scope.launch(Dispatchers.Default) {
             try {
@@ -231,14 +268,16 @@ class TrainerService(
                 var consecutiveNaN = 0
                 val nanLimit = 200
 
-                while (isActive && !stopRequested) {
+                while (isActive && !stopRequested && runId == myId) {
                     var sumLoss = 0f
                     var nanCount = 0
                     var broke = false
 
                     outer@ for (rep in 0 until epochsPerTick) {
                         for (melody in Melodies.raw) {
-                            if (stopRequested || !isActive) { broke = true; break@outer }
+                            if (stopRequested || !isActive || runId != myId) {
+                                broke = true; break@outer
+                            }
                             try {
                                 val enc = Melodies.encode(melody)
                                 if (enc.size < 2) continue
@@ -258,7 +297,6 @@ class TrainerService(
 
                     val avg = sumLoss / (epochsPerTick * Melodies.raw.size)
 
-                    // NaN-контроль
                     if (avg.isNaN() || avg.isInfinite()) {
                         consecutiveNaN++
                         if (consecutiveNaN >= nanLimit) {
@@ -268,32 +306,36 @@ class TrainerService(
                             try {
                                 if (ckptBackup.exists()) {
                                     Checkpoint.load(ckptBackup, net)
+                                    localEpoch = lastCkptEpoch
                                     _state.value = TrainState(
-                                        epoch = lastCkptEpoch,
-                                        loss = 0f,
-                                        bestLoss = localBest,
-                                        running = true,
+                                        epoch = localEpoch, loss = 0f,
+                                        bestLoss = localBest, running = true,
                                         step = net.step,
                                     )
-                                    localEpoch = lastCkptEpoch
                                 }
                             } catch (_: Exception) {}
                             consecutiveNaN = 0
                         }
-                    } else {
-                        consecutiveNaN = 0
-                    }
+                    } else consecutiveNaN = 0
 
                     if (!avg.isNaN() && !avg.isInfinite() && avg < localBest) {
                         localBest = avg
                     }
 
+                    // Обновляем историю loss только на адекватных значениях
+                    if (!avg.isNaN() && !avg.isInfinite()) {
+                        val newHist = _lossHistory.value.toMutableList()
+                        newHist.add(avg)
+                        if (newHist.size > LOSS_HISTORY_SIZE) {
+                            newHist.removeAt(0)
+                        }
+                        _lossHistory.value = newHist
+                    }
+
                     _state.value = TrainState(
                         epoch = localEpoch,
                         loss = if (avg.isNaN() || avg.isInfinite()) _state.value.loss else avg,
-                        bestLoss = localBest,
-                        running = true,
-                        step = net.step,
+                        bestLoss = localBest, running = true, step = net.step,
                     )
 
                     if (localEpoch % 20L == 0L) {
@@ -304,7 +346,8 @@ class TrainerService(
                     }
 
                     if (localEpoch % 200L == 0L) {
-                        val seed = if (mask[60]) 60 else mask.indexOfFirst { it }.coerceAtLeast(0)
+                        val seed = if (mask[60]) 60
+                        else mask.indexOfFirst { it }.coerceAtLeast(0)
                         val sampleIdx = net.sample(seed, 32, 0.8f, mask)
                         val notes = sampleIdx.toList()
                         _samples.value = notes
@@ -319,23 +362,28 @@ class TrainerService(
 
                     delay(tickDelayMs)
                 }
+            } catch (e: CancellationException) {
+                // Нормальная остановка
             } catch (e: Exception) {
                 val m = "[${now()}] training crashed: " +
                         "${e.javaClass.simpleName}: ${e.message}"
                 writeFile(m); _log.tryEmit(m)
             } finally {
-                _state.value = _state.value.copy(running = false)
-                stopRequested = false
+                if (runId == myId) {
+                    _state.value = _state.value.copy(running = false)
+                    stopRequested = false
+                    job = null
+                }
             }
         }
     }
 
     fun stopTraining() {
         stopRequested = true
+        runId++
         val j = this.job
         this.job = null
         j?.cancel()
-
         _state.value = _state.value.copy(running = false)
 
         val epochToSave = _state.value.epoch
@@ -368,19 +416,16 @@ class TrainerService(
             writeFile(msg); _log.tryEmit(msg)
             return false
         }
-
         saveCheckpoint(epoch, best)
         return true
     }
 
     private fun saveCheckpoint(epoch: Long, best: Float) {
-        // Защита: не сохраняем испорченную модель
         if (best.isNaN() || best.isInfinite()) {
             val m = "[${now()}] refuse to save: bestLoss is NaN/Inf"
             writeFile(m); _log.tryEmit(m)
             return
         }
-
         val safeBest = if (best <= 0f) Float.MAX_VALUE else best
 
         try {
@@ -518,7 +563,7 @@ class TrainerService(
 
     fun listImportedMidi(): List<File> {
         return midiFolder.listFiles { f ->
-            f.isFile && (f.name.endsWith(".mid", true) || f.name.endsWith(".midi", true))
+            f.isFile && !f.name.startsWith(".")
         }?.sortedByDescending { it.lastModified() } ?: emptyList()
     }
 
@@ -542,10 +587,9 @@ class TrainerService(
         } catch (_: Exception) { false }
     }
 
-    fun parseMidiFile(file: File): List<Int>? {
+    fun parseMidiFile(file: File): MidiReader.Parsed? {
         return try {
-            val parsed = MidiReader.parse(file)
-            parsed.notes.takeIf { it.isNotEmpty() }
+            MidiReader.parse(file).takeIf { it.notes.isNotEmpty() }
         } catch (_: Exception) { null }
     }
 

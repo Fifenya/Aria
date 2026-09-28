@@ -24,9 +24,7 @@ internal fun softmax(logits: FloatArray): FloatArray {
     }
     var sum = 0f
     val out = FloatArray(logits.size)
-    for (i in logits.indices) {
-        out[i] = exp(logits[i] - max); sum += out[i]
-    }
+    for (i in logits.indices) { out[i] = exp(logits[i] - max); sum += out[i] }
     if (sum <= 0f || sum.isNaN()) {
         val u = 1f / logits.size
         return FloatArray(logits.size) { u }
@@ -35,7 +33,6 @@ internal fun softmax(logits: FloatArray): FloatArray {
     return out
 }
 
-/** Softmax с маской: ноты, которых нет в датасете, получают вероятность 0. */
 internal fun softmaxMasked(logits: FloatArray, mask: BooleanArray): FloatArray {
     require(logits.size == mask.size)
     var max = Float.NEGATIVE_INFINITY
@@ -47,9 +44,7 @@ internal fun softmaxMasked(logits: FloatArray, mask: BooleanArray): FloatArray {
     var sum = 0f
     val out = FloatArray(logits.size)
     for (i in logits.indices) {
-        if (mask[i]) {
-            out[i] = exp(logits[i] - max); sum += out[i]
-        } else out[i] = 0f
+        if (mask[i]) { out[i] = exp(logits[i] - max); sum += out[i] } else out[i] = 0f
     }
     if (sum <= 0f || sum.isNaN()) {
         val u = 1f / logits.size

@@ -5,35 +5,31 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Колонна: прямая вертикаль слева, сужена кверху -->
     <path
-        android:fillColor="#7CFC7C"
+        android:fillColor="#FFFFFF"
         android:pathData="M 30,84 L 36,84 L 36,34 Q 36,30 32,30 L 30,30 Z" />
 
-    <!-- Шея: изгиб от верха колонны вправо-вниз -->
     <path
-        android:fillColor="#7CFC7C"
+        android:fillColor="#FFFFFF"
         android:pathData="M 32,28 Q 50,22 72,38 Q 82,46 84,60 L 80,62 Q 76,50 68,44 Q 50,32 34,34 Z" />
 
-    <!-- Резонатор: толстая горизонтальная база снизу -->
     <path
-        android:fillColor="#7CFC7C"
+        android:fillColor="#FFFFFF"
         android:pathData="M 30,80 L 86,80 Q 90,80 90,84 Q 90,88 86,88 L 30,88 Q 26,88 26,84 Q 26,80 30,80 Z" />
 
-    <!-- Струны: 5 тонких вертикалей разной длины -->
     <path
-        android:fillColor="#7CFC7C"
+        android:fillColor="#FFFFFF"
         android:pathData="M 43,32 L 45,32 L 45,80 L 43,80 Z" />
     <path
-        android:fillColor="#7CFC7C"
+        android:fillColor="#FFFFFF"
         android:pathData="M 51,30 L 53,30 L 53,80 L 51,80 Z" />
     <path
-        android:fillColor="#7CFC7C"
+        android:fillColor="#FFFFFF"
         android:pathData="M 59,30 L 61,30 L 61,80 L 59,80 Z" />
     <path
-        android:fillColor="#7CFC7C"
+        android:fillColor="#FFFFFF"
         android:pathData="M 67,32 L 69,32 L 69,80 L 67,80 Z" />
     <path
-        android:fillColor="#7CFC7C"
+        android:fillColor="#FFFFFF"
         android:pathData="M 75,38 L 77,38 L 77,80 L 75,80 Z" />
 </vector>

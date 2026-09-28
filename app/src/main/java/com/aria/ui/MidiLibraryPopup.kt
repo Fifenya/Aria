@@ -33,6 +33,7 @@ fun MidiLibraryPopup(
     onSelectFile: (File) -> Unit,
     onDeleteFile: (File) -> Unit,
     onGenerateNew: () -> Unit,
+    onExport: () -> Unit,
     onRefresh: () -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
@@ -127,6 +128,23 @@ fun MidiLibraryPopup(
                             IconNote(c.accent, size = 14.dp)
                             Text(
                                 "New",
+                                color = c.accent,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                            )
+                        }
+                    }
+                    AriaIconButton(
+                        onClick = onExport,
+                        modifier = Modifier.weight(1f).height(36.dp),
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            IconSave(c.accent, size = 14.dp)
+                            Text(
+                                "Export",
                                 color = c.accent,
                                 fontFamily = FontFamily.Monospace,
                                 fontSize = 11.sp,
