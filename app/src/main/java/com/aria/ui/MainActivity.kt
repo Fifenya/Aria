@@ -28,6 +28,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.aria.midi.AudioExporter
 import com.aria.midi.MidiPlayer
@@ -127,7 +128,13 @@ class MainActivity : ComponentActivity() {
 
             var modelSummary by remember { mutableStateOf(trainer.summary()) }
 
-            // Тикаем 1 раз в секунду, чтобы таймер обучения в UI обновлялся
+            var exportProgress by remember { mutableStateOf(0f) }
+            var exporting by remember { mutableStateOf(false) }
+            var lastExportName by remember { mutableStateOf<String?>(null) }
+            var lastExportFile by remember { mutableStateOf<File?>(null) }
+            var withReverb by remember { mutableStateOf(true) }
+
+            // Тик для обновления таймера раз в секунду
             var elapsedTick by remember { mutableStateOf(0L) }
             LaunchedEffect(Unit) {
                 while (true) {
@@ -222,6 +229,11 @@ class MainActivity : ComponentActivity() {
                     importedFiles = importedFiles,
                     createdFiles = createdFiles,
 
+                    exporting = exporting,
+                    exportProgress = exportProgress,
+                    lastExportName = lastExportName,
+                    withReverb = withReverb,
+
                     onOpenSettings = { showSettings = true },
                     onOpenFaq = { showFaq = true },
                     onOpenPrompt = { showPrompt = true },
@@ -246,16 +258,14 @@ class MainActivity : ComponentActivity() {
                         }
                     },
 
-                    onToggleLibrary = { showLibrary = !showLibrary },
-                    onLibraryDismiss = { showLibrary = false },
-                    onLibraryRefresh = { refreshLibrary() },
-
                     onExport = {
                         val notes = lastTimedNotes
                         if (notes.isEmpty()) {
                             logLines.add("[${now()}] export: nothing to export")
                             if (logLines.size > 200) logLines.removeAt(0)
-                        } else {
+                        } else if (!exporting) {
+                            exporting = true
+                            exportProgress = 0f
                             activityScope.launch(Dispatchers.IO) {
                                 try {
                                     val outDir = File(trainer.outputsDir(), "audio")
@@ -264,9 +274,12 @@ class MainActivity : ComponentActivity() {
                                         notes = notes,
                                         outputDir = outDir,
                                         baseName = "aria_export",
-                                        withReverb = true,
+                                        withReverb = withReverb,
+                                        onProgress = { p -> exportProgress = p },
                                     )
                                     withContext(Dispatchers.Main) {
+                                        lastExportName = result.m4a?.name ?: result.wav?.name
+                                        lastExportFile = result.m4a ?: result.wav
                                         logLines.add(
                                             "[${now()}] exported ${result.durationMs / 1000}s  " +
                                                     "wav=${result.wav?.name ?: "—"}  " +
@@ -280,10 +293,45 @@ class MainActivity : ComponentActivity() {
                                         logLines.add("[${now()}] export failed: ${e.message}")
                                         if (logLines.size > 200) logLines.removeAt(0)
                                     }
+                                } finally {
+                                    withContext(Dispatchers.Main) {
+                                        exporting = false
+                                        exportProgress = 0f
+                                    }
                                 }
                             }
                         }
                     },
+
+                    onShare = {
+                        val file = lastExportFile
+                        if (file != null && file.exists()) {
+                            try {
+                                val uri = FileProvider.getUriForFile(
+                                    this@MainActivity,
+                                    "$packageName.fileprovider",
+                                    file,
+                                )
+                                val mime = if (file.extension.equals("m4a", true))
+                                    "audio/mp4" else "audio/wav"
+                                val send = Intent(Intent.ACTION_SEND).apply {
+                                    type = mime
+                                    putExtra(Intent.EXTRA_STREAM, uri)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                startActivity(Intent.createChooser(send, "Share audio"))
+                            } catch (e: Exception) {
+                                logLines.add("[${now()}] share failed: ${e.message}")
+                                if (logLines.size > 200) logLines.removeAt(0)
+                            }
+                        }
+                    },
+
+                    onToggleReverb = { withReverb = it },
+
+                    onToggleLibrary = { showLibrary = !showLibrary },
+                    onLibraryDismiss = { showLibrary = false },
+                    onLibraryRefresh = { refreshLibrary() },
 
                     onLibrarySelectFile = { file ->
                         val parsed = trainer.parseMidiFile(file)
@@ -509,6 +557,7 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun AriaScreen(
+    // ---------- Данные ----------
     stats: com.aria.stats.AriaStats,
     trainState: TrainState,
     lossHistory: List<Float>,
@@ -521,6 +570,13 @@ fun AriaScreen(
     importedFiles: List<File>,
     createdFiles: List<File>,
 
+    // ---------- Экспорт ----------
+    exporting: Boolean,
+    exportProgress: Float,
+    lastExportName: String?,
+    withReverb: Boolean,
+
+    // ---------- Колбэки ----------
     onOpenSettings: () -> Unit,
     onOpenFaq: () -> Unit,
     onOpenPrompt: () -> Unit,
@@ -529,6 +585,8 @@ fun AriaScreen(
     onImportMidi: () -> Unit,
     onSave: () -> Unit,
     onExport: () -> Unit,
+    onShare: () -> Unit,
+    onToggleReverb: (Boolean) -> Unit,
 
     onToggleLibrary: () -> Unit,
     onLibraryDismiss: () -> Unit,
@@ -569,14 +627,22 @@ fun AriaScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         IconHarp(c.accent, size = 22.dp)
-                        Text(
-                            "ARIA  v0.9.0",
-                            color = c.accent,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 18.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                        Column {
+                            Text(
+                                "ARIA",
+                                color = c.accent,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 18.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                "v1.0.0-alpha",
+                                color = c.dim,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                            )
+                        }
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         AriaIconButton(
@@ -611,12 +677,10 @@ fun AriaScreen(
 
                 HorizontalDivider(color = c.line, modifier = Modifier.padding(vertical = 6.dp))
 
-                // График обучения
-                // (elapsedTick используется как ключ, чтобы перекомпоновка раз в секунду)
-                val liveElapsed = if (trainState.running) elapsedMs + 0L else elapsedMs
+                // График
                 LossChart(
                     history = lossHistory,
-                    elapsedMs = liveElapsed,
+                    elapsedMs = elapsedMs,
                     bestLoss = trainState.bestLoss,
                     running = trainState.running,
                     modifier = Modifier.fillMaxWidth(),
@@ -655,7 +719,7 @@ fun AriaScreen(
                     summary = summary,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .weight(1.2f),
+                        .weight(1f),
                 )
 
                 HorizontalDivider(color = c.line)
@@ -664,7 +728,7 @@ fun AriaScreen(
                     playerState = playerState,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .weight(1f),
+                        .weight(0.25f),
                 )
 
                 HorizontalDivider(color = c.line)
@@ -687,8 +751,14 @@ fun AriaScreen(
             onDeleteFile = onLibraryDeleteFile,
             onGenerateNew = onLibraryGenerateNew,
             onExport = onExport,
+            onShare = onShare,
             onRefresh = onLibraryRefresh,
             onDismiss = onLibraryDismiss,
+            exporting = exporting,
+            exportProgress = exportProgress,
+            lastExportName = lastExportName,
+            withReverb = withReverb,
+            onToggleReverb = onToggleReverb,
             modifier = Modifier
                 .align(Alignment.BottomStart)
                 .padding(start = 12.dp, end = 170.dp, bottom = 84.dp),

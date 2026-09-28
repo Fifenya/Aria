@@ -6,12 +6,7 @@ import android.media.AudioTrack
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlin.math.PI
 import kotlin.math.abs
-import kotlin.math.exp
-import kotlin.math.pow
-import kotlin.math.sin
-import java.util.Random
 
 data class PlayerState(
     val playing: Boolean = false,
@@ -29,7 +24,6 @@ data class PlayerState(
     val hasDrums: Boolean = false,
     val drumCount: Int = 0,
     val tempoChanges: Int = 1,
-    /** Полная последовательность нот — для отображения списка NOTES. */
     val noteSequence: List<Int> = emptyList(),
 )
 
@@ -62,7 +56,6 @@ class MidiPlayer(private val sampleRate: Int = 44100) {
         _state.value = _state.value.copy(volume = currentVolume)
     }
 
-    /** Простой вход: список нот, играется равномерно. Для генерации. */
     fun play(
         notes: List<Int>,
         noteMs: Int = 350,
@@ -104,7 +97,6 @@ class MidiPlayer(private val sampleRate: Int = 44100) {
         startTimedThread()
     }
 
-    /** Полный вход: ноты с реальным таймингом из MIDI. */
     fun playTimed(
         notes: List<TimedNote>,
         volume: Float = 0.35f,
@@ -201,38 +193,24 @@ class MidiPlayer(private val sampleRate: Int = 44100) {
 
         thread = Thread {
             try {
-                // 1. Общий стерео-буфер
                 val totalMs = currentTimed.last().startMs + currentTimed.last().durationMs
-                val totalSamples = (totalMs * sampleRate / 1000).toInt().coerceAtLeast(sampleRate)
-                val buf = FloatArray(totalSamples)
 
-                for (tn in currentTimed) {
-                    if (stopRequested) return@Thread
-                    val startSample = (tn.startMs * sampleRate / 1000).toInt()
-                    val durSamples = (tn.durationMs.toLong() * sampleRate / 1000).toInt()
-                        .coerceAtLeast(64)
-                    val endSample = (startSample + durSamples).coerceAtMost(totalSamples)
-                    if (startSample >= totalSamples) continue
-                    val len = endSample - startSample
-                    val vol = currentVolume * (tn.velocity / 127f)
-                    val synth = if (tn.isDrum) {
-                        synthDrum(tn.note, len, vol)
-                    } else {
-                        synthNote(tn.note, len, vol)
-                    }
-                    for (i in 0 until len) buf[startSample + i] += synth[i]
-                }
+                // 1. Рендер всего буфера (stereo interleaved)
+                val stereo = Synth.render(currentTimed, sampleRate, gain = currentVolume)
 
-                // 2. Нормализация
+                // 2. Chorus — «оркестровая» ширина
+                Synth.applyChorus(stereo, sampleRate, mix = 0.25f)
+
+                // 3. Нормализация
                 var maxAbs = 0f
-                for (v in buf) { val a = abs(v); if (a > maxAbs) maxAbs = a }
+                for (v in stereo) { val a = abs(v); if (a > maxAbs) maxAbs = a }
                 if (maxAbs > 1f) {
                     val sc = 1f / maxAbs
-                    for (i in buf.indices) buf[i] *= sc
+                    for (i in stereo.indices) stereo[i] *= sc
                 }
 
-                // 3. Выбор режима: STATIC для коротких, STREAM с большим буфером для длинных
-                val bytesNeeded = buf.size * 4
+                // 4. STATIC для коротких, STREAM для длинных
+                val bytesNeeded = stereo.size * 4
                 val staticMax = 4 * 1024 * 1024
                 val useStatic = bytesNeeded <= staticMax
 
@@ -248,18 +226,22 @@ class MidiPlayer(private val sampleRate: Int = 44100) {
                             AudioFormat.Builder()
                                 .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
                                 .setSampleRate(sampleRate)
-                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                                 .build()
                         )
                         .setBufferSizeInBytes(bytesNeeded)
                         .setTransferMode(AudioTrack.MODE_STATIC)
                         .build()
-                    try { b.write(buf, 0, buf.size, AudioTrack.WRITE_BLOCKING) } catch (_: Exception) {}
+                    try {
+                        b.write(stereo, 0, stereo.size, AudioTrack.WRITE_BLOCKING)
+                    } catch (_: Exception) {}
                     b
                 } else {
                     val minBufBytes = AudioTrack.getMinBufferSize(
-                        sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT,
-                    ).coerceAtLeast(sampleRate * 4)
+                        sampleRate,
+                        AudioFormat.CHANNEL_OUT_STEREO,
+                        AudioFormat.ENCODING_PCM_FLOAT,
+                    ).coerceAtLeast(sampleRate * 8)
                     AudioTrack.Builder()
                         .setAudioAttributes(
                             AudioAttributes.Builder()
@@ -271,10 +253,10 @@ class MidiPlayer(private val sampleRate: Int = 44100) {
                             AudioFormat.Builder()
                                 .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
                                 .setSampleRate(sampleRate)
-                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                                 .build()
                         )
-                        .setBufferSizeInBytes(minBufBytes * 8)
+                        .setBufferSizeInBytes(minBufBytes * 4)
                         .setTransferMode(AudioTrack.MODE_STREAM)
                         .build()
                 }
@@ -299,19 +281,21 @@ class MidiPlayer(private val sampleRate: Int = 44100) {
                         return@Thread
                     }
                 } else {
-                    val chunk = sampleRate
+                    // STREAM: пишем по 1 сек stereo (2 × sampleRate floats)
+                    val chunkFloats = sampleRate * 2
                     do {
                         var offset = 0
-                        while (offset < buf.size && !stopRequested) {
+                        while (offset < stereo.size && !stopRequested) {
                             while (paused && !stopRequested) Thread.sleep(40)
                             if (stopRequested) break
-                            val toWrite = minOf(chunk, buf.size - offset)
+                            val toWrite = minOf(chunkFloats, stereo.size - offset)
                             val written = try {
-                                t.write(buf, offset, toWrite, AudioTrack.WRITE_BLOCKING)
+                                t.write(stereo, offset, toWrite, AudioTrack.WRITE_BLOCKING)
                             } catch (_: Exception) { -1 }
                             if (written <= 0) break
                             offset += written
-                            val currentMs = offset.toLong() * 1000L / sampleRate
+                            val frames = offset / 2
+                            val currentMs = frames.toLong() * 1000L / sampleRate
                             updateProgress(currentMs, totalMs)
                         }
                     } while (loopEnabled && !stopRequested)
@@ -347,69 +331,5 @@ class MidiPlayer(private val sampleRate: Int = 44100) {
             playing = true,
             paused = false,
         )
-    }
-
-    private fun midiToHz(note: Int): Double = 440.0 * 2.0.pow((note - 69) / 12.0)
-
-    private fun synthNote(note: Int, samples: Int, volume: Float): FloatArray {
-        val f = midiToHz(note)
-        val buf = FloatArray(samples)
-        val attack = (sampleRate * 0.008).toInt().coerceAtLeast(1)
-        val decay = (sampleRate * 0.35).toInt().coerceAtLeast(1)
-
-        for (i in 0 until samples) {
-            val t = i.toDouble() / sampleRate
-            val s = sin(2 * PI * f * t) * 1.00 +
-                    sin(2 * PI * f * 2 * t) * 0.30 +
-                    sin(2 * PI * f * 3 * t) * 0.12
-            val env = when {
-                i < attack -> i.toFloat() / attack
-                else -> exp(-((i - attack).toDouble() / decay).coerceAtLeast(0.0)).toFloat()
-            }
-            buf[i] = (s / 1.6 * env * volume).toFloat()
-        }
-        return buf
-    }
-
-    private fun synthDrum(note: Int, samples: Int, volume: Float): FloatArray {
-        val buf = FloatArray(samples)
-        val rng = Random(note.toLong() * 31L + samples)
-
-        val isKick = note in 35..36
-        val isSnare = note in 38..40
-        val isHat = note in 42..44 || note == 46
-        val isTom = note in 41..50 && !isSnare && !isHat && !isKick
-
-        val decaySamples = when {
-            isKick -> (sampleRate * 0.18).toInt()
-            isSnare -> (sampleRate * 0.10).toInt()
-            isHat -> (sampleRate * 0.035).toInt()
-            isTom -> (sampleRate * 0.20).toInt()
-            else -> (sampleRate * 0.08).toInt()
-        }.coerceAtLeast(1)
-
-        val toneFreq = when {
-            isKick -> 55.0
-            isSnare -> 180.0
-            isTom -> 440.0 * 2.0.pow((note.coerceIn(41, 50) + 20 - 69) / 12.0)
-            else -> 0.0
-        }
-        val noiseMix = when {
-            isKick -> 0.05f
-            isSnare -> 0.75f
-            isHat -> 1.0f
-            isTom -> 0.15f
-            else -> 0.5f
-        }
-
-        for (i in 0 until samples) {
-            val env = exp(-i.toDouble() / decaySamples).toFloat()
-            val noise = (rng.nextFloat() * 2f - 1f)
-            val t = i.toDouble() / sampleRate
-            val tone = if (toneFreq > 0) sin(2 * PI * toneFreq * t) else 0.0
-            val s = (noise * noiseMix + tone * (1f - noiseMix))
-            buf[i] = (s * env * volume).toFloat()
-        }
-        return buf
     }
 }

@@ -7,6 +7,7 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -19,6 +20,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -34,8 +36,14 @@ fun MidiLibraryPopup(
     onDeleteFile: (File) -> Unit,
     onGenerateNew: () -> Unit,
     onExport: () -> Unit,
+    onShare: () -> Unit,
     onRefresh: () -> Unit,
     onDismiss: () -> Unit,
+    exporting: Boolean,
+    exportProgress: Float,
+    lastExportName: String?,
+    withReverb: Boolean,
+    onToggleReverb: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val c = LocalAriaColors.current
@@ -55,7 +63,6 @@ fun MidiLibraryPopup(
                 .border(1.dp, c.line, RoundedCornerShape(14.dp)),
         ) {
             Column(Modifier.padding(12.dp)) {
-                // Заголовок
                 Row(
                     Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -70,16 +77,14 @@ fun MidiLibraryPopup(
                     AriaIconButton(
                         onClick = onDismiss,
                         modifier = Modifier.size(28.dp),
-                    ) {
-                        IconClose(c.accent, size = 14.dp)
-                    }
+                    ) { IconClose(c.accent, size = 14.dp) }
                 }
 
                 HorizontalDivider(color = c.line, modifier = Modifier.padding(vertical = 8.dp))
 
                 Column(
                     Modifier
-                        .heightIn(max = 320.dp)
+                        .heightIn(max = 280.dp)
                         .verticalScroll(rememberScrollState()),
                 ) {
                     if (created.isEmpty() && imported.isEmpty()) {
@@ -94,9 +99,7 @@ fun MidiLibraryPopup(
 
                     if (created.isNotEmpty()) {
                         SectionLabel("CREATED", c)
-                        created.forEach { f ->
-                            FileRow(f, c, onSelectFile, onDeleteFile)
-                        }
+                        created.forEach { f -> FileRow(f, c, onSelectFile, onDeleteFile) }
                     }
 
                     if (created.isNotEmpty() && imported.isNotEmpty()) {
@@ -105,14 +108,69 @@ fun MidiLibraryPopup(
 
                     if (imported.isNotEmpty()) {
                         SectionLabel("IMPORTED", c)
-                        imported.forEach { f ->
-                            FileRow(f, c, onSelectFile, onDeleteFile)
-                        }
+                        imported.forEach { f -> FileRow(f, c, onSelectFile, onDeleteFile) }
                     }
                 }
 
                 HorizontalDivider(color = c.line, modifier = Modifier.padding(vertical = 8.dp))
 
+                // Reverb toggle
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(c.bg)
+                        .clickable { onToggleReverb(!withReverb) }
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Box(
+                        Modifier
+                            .size(14.dp)
+                            .clip(RoundedCornerShape(3.dp))
+                            .background(if (withReverb) c.accent else Color.Transparent)
+                            .border(1.dp, c.accent, RoundedCornerShape(3.dp)),
+                    )
+                    Text(
+                        "reverb",
+                        color = c.text,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                    )
+                }
+
+                Spacer(Modifier.height(8.dp))
+
+                // Экспорт прогресс
+                if (exporting) {
+                    Column(Modifier.fillMaxWidth()) {
+                        Text(
+                            "exporting… ${(exportProgress * 100).toInt()}%",
+                            color = c.accent,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp,
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .height(4.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(c.line),
+                        ) {
+                            Box(
+                                Modifier
+                                    .fillMaxWidth(exportProgress.coerceIn(0f, 1f))
+                                    .fillMaxHeight()
+                                    .background(c.accent),
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+
+                // Кнопки
                 Row(
                     Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -134,34 +192,55 @@ fun MidiLibraryPopup(
                             )
                         }
                     }
+
                     AriaIconButton(
                         onClick = onExport,
                         modifier = Modifier.weight(1f).height(36.dp),
                     ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        Text(
+                            if (exporting) "…" else "Export",
+                            color = c.accent,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                        )
+                    }
+
+                    if (lastExportName != null) {
+                        AriaIconButton(
+                            onClick = onShare,
+                            modifier = Modifier.weight(1f).height(36.dp),
                         ) {
-                            IconSave(c.accent, size = 14.dp)
                             Text(
-                                "Export",
+                                "Share",
+                                color = c.accent,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                            )
+                        }
+                    } else {
+                        AriaIconButton(
+                            onClick = onRefresh,
+                            modifier = Modifier.weight(1f).height(36.dp),
+                        ) {
+                            Text(
+                                "Refresh",
                                 color = c.accent,
                                 fontFamily = FontFamily.Monospace,
                                 fontSize = 11.sp,
                             )
                         }
                     }
-                    AriaIconButton(
-                        onClick = onRefresh,
-                        modifier = Modifier.weight(1f).height(36.dp),
-                    ) {
-                        Text(
-                            "Refresh",
-                            color = c.accent,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 11.sp,
-                        )
-                    }
+                }
+
+                // Имя последнего экспорта
+                if (lastExportName != null) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "saved: $lastExportName",
+                        color = c.dim,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 9.sp,
+                    )
                 }
             }
         }

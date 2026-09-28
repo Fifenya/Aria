@@ -15,49 +15,52 @@ object AudioExporter {
 
     private const val SAMPLE_RATE = 44100
 
-    /**
-     * Экспортирует мелодию в WAV и/или M4A (AAC).
-     * baseName — префикс (без расширения).
-     */
     fun export(
         notes: List<TimedNote>,
         outputDir: File,
         baseName: String = "aria_export",
         withReverb: Boolean = true,
+        onProgress: ((Float) -> Unit)? = null,
     ): ExportResult {
         outputDir.mkdirs()
         if (notes.isEmpty()) return ExportResult(null, null, SAMPLE_RATE, 0L)
 
+        onProgress?.invoke(0.05f)
         val sorted = notes.sortedBy { it.startMs }
 
-        // 1. Синтез в стерео
+        // 1. Синтез
         var stereo = Synth.render(sorted, SAMPLE_RATE, gain = 0.85f)
+        onProgress?.invoke(0.4f)
 
-        // 2. Reverb
+        // 2. Chorus (лёгкий, не мыльный)
+        Synth.applyChorus(stereo, SAMPLE_RATE, mix = 0.15f)
+        onProgress?.invoke(0.55f)
+
+        // 3. Reverb (опционально)
         if (withReverb) {
             stereo = Reverb(SAMPLE_RATE).process(stereo)
         }
+        onProgress?.invoke(0.7f)
 
-        // 3. Финальный fade-out 250 мс
+        // 4. Fade-out и soft-clip
         applyFadeOut(stereo, SAMPLE_RATE, 250)
+        Synth.softClip(stereo, drive = 1.1f)
+        normalize(stereo, 0.9f)
+        onProgress?.invoke(0.8f)
 
-        // 4. Нормализация под пик 0.95
-        normalize(stereo, 0.95f)
-
-        // 5. Имена файлов
         val stamp = LocalDateTime.now()
             .format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
         val wavFile = File(outputDir, "${baseName}_$stamp.wav")
         val m4aFile = File(outputDir, "${baseName}_$stamp.m4a")
 
-        // 6. WAV
         val wav = try {
             WavWriter.write(wavFile, stereo, SAMPLE_RATE)
             wavFile
         } catch (_: Exception) { null }
+        onProgress?.invoke(0.9f)
 
-        // 7. AAC
         val m4a = if (AacEncoder.encode(m4aFile, stereo, SAMPLE_RATE)) m4aFile else null
+        onProgress?.invoke(1f)
 
         val durationMs = (stereo.size / 2L * 1000L) / SAMPLE_RATE
         return ExportResult(wav, m4a, SAMPLE_RATE, durationMs)

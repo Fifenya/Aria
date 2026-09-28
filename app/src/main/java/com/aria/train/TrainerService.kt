@@ -127,14 +127,16 @@ class TrainerService(
     @Volatile
     private var trainingStartedAtMs: Long = 0L
 
-    /** Сколько миллисекунд идёт текущий прогон. 0 — если обучение не запускалось. */
+    @Volatile
+    private var trainingStoppedAtMs: Long = 0L
+
+    /** Сколько миллисекунд идёт текущий прогон. После остановки — замирает. */
     fun trainingElapsedMs(): Long {
         val start = trainingStartedAtMs
-        if (start <= 0L || !_state.value.running) {
-            // Если остановлено — держим значение, но не растёт
-            return if (start <= 0L) 0L else System.currentTimeMillis() - start
-        }
-        return System.currentTimeMillis() - start
+        if (start <= 0L) return 0L
+        val stopped = trainingStoppedAtMs
+        val end = if (stopped > 0L) stopped else System.currentTimeMillis()
+        return (end - start).coerceAtLeast(0L)
     }
 
     // ---------- INIT ----------
@@ -254,6 +256,7 @@ class TrainerService(
         stopRequested = false
         val myId = ++runId
         trainingStartedAtMs = System.currentTimeMillis()
+        trainingStoppedAtMs = 0L
 
         job = scope.launch(Dispatchers.Default) {
             try {
@@ -385,6 +388,7 @@ class TrainerService(
         this.job = null
         j?.cancel()
         _state.value = _state.value.copy(running = false)
+        trainingStoppedAtMs = System.currentTimeMillis()
 
         val epochToSave = _state.value.epoch
         val bestToSave = _state.value.bestLoss
